@@ -1,9 +1,8 @@
 """
 Discord Music Bot — 24/7 Voice stabil (Railway)
 ────────────────────────────────────────────────
-Fix: Keine parallelen Verbindungsversuche mehr,
-     disconnect-Erkennung nur für Zielkanal,
-     sauberer State-Reset mit Wartezeit.
+Fix: Exklusive Join‑Tasks ohne vorzeitige Abbruchprüfung,
+     saubere Wartezeiten, keine parallelen Verbindungen.
 """
 
 import asyncio
@@ -124,7 +123,7 @@ def get_state(guild: discord.Guild) -> MusicState:
         _states[guild.id] = MusicState()
     return _states[guild.id]
 
-# Lock pro Guild, damit nur ein Verbindungsversuch gleichzeitig läuft
+# Exklusiver Join-Lock pro Guild
 _join_locks: dict[int, asyncio.Lock] = {}
 
 def get_join_lock(guild_id: int) -> asyncio.Lock:
@@ -179,11 +178,10 @@ async def on_guild_join(guild: discord.Guild):
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
-    """Nur auf echte Trennungen vom Zielkanal reagieren."""
+    """Nur bei echten Trennungen vom Zielkanal."""
     if member.id != bot.user.id:
         return
 
-    # Nur wenn der Bot den Zielkanal VERLÄSST (nicht bei fehlgeschlagenem Connect)
     if before.channel and before.channel.id == TARGET_VOICE_CHANNEL_ID and after.channel is None:
         print(f"⚠️  Bot hat Zielkanal «{before.channel.name}» verlassen → erneut verbinden")
         asyncio.create_task(join_retry_loop(member.guild))
@@ -201,20 +199,20 @@ async def on_command_error(ctx: commands.Context, error):
 
 
 # ══════════════════════════════════════════════════════════
-#  VERBINDUNGSLOGIK (SEQUENZIELL, EIN VERSUCH ZUGLEICH)
+#  VERBINDUNGSLOGIK (EXKLUSIV, SEQUENZIELL)
 # ══════════════════════════════════════════════════════════
 
 async def join_retry_loop(guild: discord.Guild):
-    """Hauptschleife für Verbindungsversuche (sichert, dass nur eine pro Guild läuft)."""
+    """
+    Exklusiver Verbindungs-Task pro Guild.
+    Wartet ggf., bis ein laufender Task den Lock freigibt,
+    und arbeitet dann alle Retries durch.
+    """
     lock = get_join_lock(guild.id)
 
-    # Nur starten, wenn nicht bereits ein Versuch läuft
-    if lock.locked():
-        print(f"   ⏳  Join für «{guild.name}» bereits aktiv – überspringe.")
-        return
-
+    # Warte, bis wir exklusiv arbeiten dürfen
     async with lock:
-        # Kleiner Startpuffer
+        # Kurzer Puffer
         await asyncio.sleep(2)
 
         for attempt in range(1, MAX_RETRIES + 1):
@@ -232,16 +230,16 @@ async def join_retry_loop(guild: discord.Guild):
 async def attempt_connection(guild: discord.Guild) -> bool:
     """
     Ein einzelner Verbindungsversuch:
-    - Entfernt alte VoiceClients komplett
-    - Wartet, bis Discord den State freigegeben hat
-    - Verbindet frisch mit reconnect=False
+    - Alten VoiceClient vollständig entfernen
+    - Warten, bis guild.voice_client None ist
+    - Neu verbinden (kein reconnect)
     """
     channel = bot.get_channel(TARGET_VOICE_CHANNEL_ID)
     if not isinstance(channel, discord.VoiceChannel):
         print("   ❌  VOICE_CHANNEL_ID ungültig oder kein VoiceChannel!")
         return False
 
-    # 1. Vorhandenen VoiceClient sauber entfernen
+    # 1. Alten VoiceClient sauber entfernen
     vc = guild.voice_client
     if vc:
         print("   🧹  Entferne alte Voice-Verbindung …")
@@ -263,7 +261,7 @@ async def attempt_connection(guild: discord.Guild) -> bool:
         else:
             print("   ⚠️  VoiceClient konnte nicht vollständig entfernt werden.")
 
-    # 2. Frisch verbinden (KEIN reconnect, wir steuern selbst)
+    # 2. Frisch verbinden
     print(f"   🔗  Verbinde mit «{channel.name}» …")
     try:
         vc = await asyncio.wait_for(
@@ -284,7 +282,7 @@ async def attempt_connection(guild: discord.Guild) -> bool:
         print(f"   ❌  Fehler: {type(exc).__name__}: {exc}")
         return False
 
-    # 3. Mute-Status setzen, falls Musik läuft
+    # 3. Mute-Status anpassen, falls Musik läuft
     state = get_state(guild)
     if state.is_playing:
         try:
@@ -400,7 +398,6 @@ async def play_next(guild: discord.Guild):
 
     vc = guild.voice_client
     if not vc or not vc.is_connected():
-        # Verbindung sicherstellen
         await join_retry_loop(guild)
         await asyncio.sleep(2)
         vc = guild.voice_client
