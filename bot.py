@@ -1,47 +1,28 @@
-import asyncio
-import os
 import discord
+from discord.ext import commands, tasks
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID"))
 
-class KeepAliveBot(discord.Client):
-    async def on_ready(self):
-        print(f"Bot online als {self.user}")
-        self.loop.create_task(self.maintain_voice())
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-    async def maintain_voice(self):
-        while True:
-            # Finde Channel
-            channel = self.get_channel(CHANNEL_ID)
-            if not isinstance(channel, discord.VoiceChannel):
-                print("Voicechannel nicht gefunden – warte 30s")
-                await asyncio.sleep(30)
-                continue
+@bot.event
+async def on_ready():
+    print(f"Eingeloggt als {bot.user}")
+    keep_connected.start()
 
-            # Prüfen, ob bereits verbunden
-            for guild in self.guilds:
-                if guild.voice_client and guild.voice_client.is_connected():
-                    if guild.voice_client.channel.id == CHANNEL_ID:
-                        print("Bereits im richtigen Channel – warte 60s")
-                        await asyncio.sleep(60)
-                        continue
+@tasks.loop(seconds=30)
+async def keep_connected():
+    channel = bot.get_channel(CHANNEL_ID)
 
-            # Versuch, zu verbinden
-            try:
-                print(f"Verbinde mit {channel.name} ...")
-                vc = await asyncio.wait_for(
-                    channel.connect(self_deaf=True, self_mute=True),
-                    timeout=30
-                )
-                print("Erfolgreich verbunden!")
-                await asyncio.sleep(60)  # Halte Check-Intervall
-            except Exception as e:
-                print(f"Fehler: {e} – warte 60s")
-                await asyncio.sleep(60)
+    if channel is None:
+        return
 
-if __name__ == "__main__":
-    intents = discord.Intents.default()
-    intents.voice_states = True
-    bot = KeepAliveBot(intents=intents)
-    bot.run(TOKEN)
+    vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
+
+    if vc is None or not vc.is_connected():
+        await channel.connect(self_deaf=True)
+        print("Voice verbunden")
+
+bot.run(TOKEN)
