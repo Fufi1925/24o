@@ -1,9 +1,8 @@
 """
-Discord Music Bot
-─────────────────
-Requires: discord.py, yt-dlp, python-dotenv, PyNaCl
-.env:  DISCORD_TOKEN=...
-       VOICE_CHANNEL_ID=...
+Discord Music Bot — 24/7 Voice stabil (Railway)
+────────────────────────────────────────────────
+Fix: Verbesserte Wiederholungslogik, kürzere Watchdog-Intervalle,
+     robustes Exception-Handling, immer deaf, Mute-Jobs.
 """
 
 import asyncio
@@ -23,10 +22,15 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════
 
 TARGET_VOICE_CHANNEL_ID: int = int(os.getenv("VOICE_CHANNEL_ID", "0"))
+WATCHDOG_INTERVAL_MINUTES = 2          # öfter prüfen
+JOIN_TIMEOUT_SECONDS = 30
+RECONNECT_DELAY_START = 2              # Start-Backoff für Voice-State-Reconnects
+MAX_VOICE_RECONNECT_ATTEMPTS = 3
+BACKOFF_FACTOR = 2                     # Verdopplung der Wartezeit
 
 YDL_OPTIONS: dict = {
     "format": "bestaudio/best",
-    "noplaylist": True,       # Playlists explizit über !playlist
+    "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
@@ -37,7 +41,7 @@ YDL_OPTIONS: dict = {
 YDL_PLAYLIST_OPTIONS: dict = {
     **YDL_OPTIONS,
     "noplaylist": False,
-    "extract_flat": "in_playlist",  # Schnelleres Laden
+    "extract_flat": "in_playlist",
 }
 
 FFMPEG_OPTIONS: dict = {
@@ -45,14 +49,10 @@ FFMPEG_OPTIONS: dict = {
         "-reconnect 1 -reconnect_streamed 1 "
         "-reconnect_delay_max 5 -nostdin"
     ),
-    "options": "-vn -filter:a loudnorm",   # Lautstärke normalisieren
+    "options": "-vn -filter:a loudnorm",
 }
 
-WATCHDOG_INTERVAL_MINUTES = 10
-JOIN_TIMEOUT_SECONDS = 30
-RECONNECT_DELAY_SECONDS = 8
-
-# Prüfe PyNaCl (Pflicht für Voice)
+# Prüfe PyNaCl
 try:
     import nacl  # noqa: F401
 except ImportError:
@@ -68,8 +68,8 @@ class Track:
     url: str
     title: str
     duration: int           # Sekunden
-    webpage_url: str = ""   # Original-URL (für Anzeige)
-    requester: str = ""     # Wer hat hinzugefügt
+    webpage_url: str = ""
+    requester: str = ""
 
     def duration_str(self) -> str:
         return format_duration(self.duration)
@@ -103,7 +103,6 @@ class MusicState:
         return self.current is not None
 
     def queue_info(self) -> str:
-        """Kurze Queue-Übersicht."""
         total = sum(t.duration for t in self.queue)
         return f"{len(self.queue)} Song(s) · {format_duration(total)}"
 
@@ -114,13 +113,12 @@ class MusicState:
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.voice_states = True     # Pflicht für Voice
+intents.voice_states = True
 intents.guilds = True
-intents.members = False         # Nicht nötig, spart Privileged-Intent
+intents.members = False
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# Ein State-Objekt pro Guild
 _states: dict[int, MusicState] = {}
 
 def get_state(guild: discord.Guild) -> MusicState:
@@ -128,7 +126,6 @@ def get_state(guild: discord.Guild) -> MusicState:
         _states[guild.id] = MusicState()
     return _states[guild.id]
 
-# Mutex gegen parallele Reconnect-Versuche (pro Guild)
 _connect_locks: dict[int, asyncio.Lock] = {}
 
 def get_connect_lock(guild_id: int) -> asyncio.Lock:
@@ -153,7 +150,7 @@ async def on_ready():
         )
     )
 
-    # Länger warten bis Gateway-Session stabil ist (verhindert 4017)
+    # Gateway-Session stabilisieren
     await asyncio.sleep(10)
 
     for guild in bot.guilds:
@@ -163,25 +160,39 @@ async def on_ready():
 
 
 @bot.event
+async def on_guild_join(guild: discord.Guild):
+    """Wenn der Bot auf einen neuen Server kommt."""
+    print(f"➕  Neue Guild: {guild.name}")
+    await asyncio.sleep(5)
+    await safe_join(guild)
+
+
+@bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
-    """Reagiert NUR auf echte Bot-Disconnects (nicht auf fehlgeschlagene Connects)."""
+    """Echter Disconnect? → Wieder verbinden mit Retry."""
     if member.id != bot.user.id:
         return
 
-    # Nur auslösen wenn Bot vorher IN einem Channel war → echter Disconnect
+    # Nur wenn Bot aus einem Channel verschwindet
     if before.channel is None or after.channel is not None:
         return
 
     guild = member.guild
     lock = get_connect_lock(guild.id)
-
-    # Wenn gerade aktiv verbunden wird → ignorieren (das ist der Fehlschlag selbst)
     if lock.locked():
         return
 
-    print(f"⚠️  Bot disconnected aus «{before.channel.name}» → Rejoin in {RECONNECT_DELAY_SECONDS}s …")
-    await asyncio.sleep(RECONNECT_DELAY_SECONDS)
-    await safe_join(guild)
+    print(f"⚠️  Bot disconnected aus «{before.channel.name}» → Reconnect mit Retry …")
+
+    # Retry-Schleife
+    for attempt in range(1, MAX_VOICE_RECONNECT_ATTEMPTS + 1):
+        delay = RECONNECT_DELAY_START * (BACKOFF_FACTOR ** (attempt - 1))
+        print(f"   🔄  Versuch {attempt}/{MAX_VOICE_RECONNECT_ATTEMPTS} nach {delay}s …")
+        await asyncio.sleep(delay)
+        if await safe_join(guild):
+            print("   ✅  Wiederverbunden!")
+            return
+    print("   ❌  Reconnect endgültig fehlgeschlagen – Watchdog übernimmt.")
 
 
 @bot.event
@@ -189,7 +200,7 @@ async def on_command_error(ctx: commands.Context, error):
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("❌ Argument fehlt. `!bothelp` für Hilfe.")
     elif isinstance(error, commands.CommandNotFound):
-        pass   # Stille Ignorierung unbekannter Befehle
+        pass
     else:
         print(f"⚠️  Command-Fehler ({ctx.command}): {error}")
         await ctx.send(f"❌ Fehler: `{error}`")
@@ -200,17 +211,16 @@ async def on_command_error(ctx: commands.Context, error):
 # ══════════════════════════════════════════════════════════
 
 async def _initial_join(guild: discord.Guild):
-    await asyncio.sleep(5)   # Extra Buffer nach on_ready
+    await asyncio.sleep(5)
     await safe_join(guild)
 
 
 async def safe_join(guild: discord.Guild) -> bool:
     """
-    Verbindet den Bot sicher mit TARGET_VOICE_CHANNEL_ID.
-    Gibt True zurück wenn erfolgreich verbunden.
+    Verbindet den Bot sicher mit dem Ziel-Voice-Channel.
+    Gibt True zurück, wenn am Ende die Verbindung besteht.
     """
     lock = get_connect_lock(guild.id)
-
     if lock.locked():
         return False
 
@@ -222,7 +232,7 @@ async def safe_join(guild: discord.Guild) -> bool:
 
         vc: Optional[discord.VoiceClient] = guild.voice_client
 
-        # Schon korrekt verbunden
+        # Schon korrekt verbunden?
         if vc and vc.is_connected() and vc.channel.id == TARGET_VOICE_CHANNEL_ID:
             return True
 
@@ -238,15 +248,23 @@ async def safe_join(guild: discord.Guild) -> bool:
         print(f"🔊  Verbinde mit «{channel.name}» …")
         try:
             vc = await asyncio.wait_for(
-                channel.connect(reconnect=False, self_deaf=True, self_mute=True),
+                channel.connect(
+                    reconnect=False,
+                    self_deaf=True,   # immer deaf – spart Bandbreite
+                    self_mute=True    # idle: stumm
+                ),
                 timeout=JOIN_TIMEOUT_SECONDS,
             )
             print("✅  Verbunden!")
 
+            # Mute-Status setzen, falls gespielt wird
             state = get_state(guild)
-            if state.is_playing:
-                await _set_voice_state(guild, channel, mute=False)
-
+            if state.is_playing and vc.is_connected():
+                await guild.change_voice_state(
+                    channel=channel,
+                    self_mute=False,
+                    self_deaf=True
+                )
             return True
 
         except asyncio.TimeoutError:
@@ -255,42 +273,23 @@ async def safe_join(guild: discord.Guild) -> bool:
         except discord.errors.ConnectionClosed as exc:
             code = exc.code
             print(f"❌  Verbindung abgelehnt (Code {code}).")
-
             if code == 4006:
-                # Session ungültig – länger warten, Discord muss aufräumen
                 print("💡  4006: Session ungültig. Warte 15s …")
                 await asyncio.sleep(15)
             elif code == 4014:
-                print("💡  4014: Bot fehlt Voice-Permission im Channel!")
+                print("💡  4014: Keine Voice-Permission im Channel!")
             elif code == 4017:
-                # Undokumentierter Code: meistens kurzzeitige Rate-Limit / Gateway-Ablehnung
                 print("💡  4017: Gateway-Ablehnung. Warte 20s …")
                 await asyncio.sleep(20)
             else:
                 await asyncio.sleep(5)
 
         except Exception as exc:
-            print(f"❌  Verbindungsfehler: {type(exc).__name__}: {exc}")
+            # Alle anderen Fehler abfangen, damit Watchdog weiterläuft
+            print(f"❌  Verbindungsfehler ({type(exc).__name__}): {exc}")
             await asyncio.sleep(5)
 
         return False
-
-
-async def _set_voice_state(
-    guild: discord.Guild,
-    channel: discord.VoiceChannel,
-    *,
-    mute: bool,
-):
-    """Self-Mute/Unmute sauber setzen."""
-    try:
-        await guild.change_voice_state(
-            channel=channel,
-            self_mute=mute,
-            self_deaf=mute,   # Taub nur wenn auch gemutet (idle)
-        )
-    except Exception as exc:
-        print(f"⚠️  Voice-State-Fehler: {exc}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -325,7 +324,6 @@ async def _before_watchdog():
 # ══════════════════════════════════════════════════════════
 
 async def fetch_track(query: str) -> Optional[Track]:
-    """Lädt Infos zu einem einzelnen Track (kein Download)."""
     loop = asyncio.get_event_loop()
 
     def _extract():
@@ -350,7 +348,6 @@ async def fetch_track(query: str) -> Optional[Track]:
 
 
 async def fetch_playlist(url: str) -> list[Track]:
-    """Lädt alle Tracks einer Playlist (flach, schnell)."""
     loop = asyncio.get_event_loop()
 
     def _extract():
@@ -391,7 +388,15 @@ async def play_next(guild: discord.Guild):
             channel = bot.get_channel(TARGET_VOICE_CHANNEL_ID)
             vc: Optional[discord.VoiceClient] = guild.voice_client
             if channel and vc and vc.is_connected():
-                await _set_voice_state(guild, channel, mute=True)
+                # Idle: stumm, deaf bleibt True
+                try:
+                    await guild.change_voice_state(
+                        channel=channel,
+                        self_mute=True,
+                        self_deaf=True
+                    )
+                except Exception as exc:
+                    print(f"⚠️  Voice-State-Fehler beim Idle: {exc}")
             print("📭  Queue leer.")
             return
 
@@ -408,10 +413,17 @@ async def play_next(guild: discord.Guild):
         vc = guild.voice_client
 
     channel = bot.get_channel(TARGET_VOICE_CHANNEL_ID)
-    await _set_voice_state(guild, channel, mute=False)
+    try:
+        await guild.change_voice_state(
+            channel=channel,
+            self_mute=False,   # Musik spielt → entstummen
+            self_deaf=True
+        )
+    except Exception as exc:
+        print(f"⚠️  Voice-State-Fehler beim Start: {exc}")
     await asyncio.sleep(0.5)
 
-    # Falls URL abgelaufen ist, neu laden
+    # Falls URL abgelaufen, neu laden
     audio_url = track.url
     try:
         source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS)
@@ -447,7 +459,6 @@ async def play_next(guild: discord.Guild):
 
 @bot.command(name="play", aliases=["p"])
 async def cmd_play(ctx: commands.Context, *, query: str):
-    """Song oder YouTube-URL abspielen."""
     state = get_state(ctx.guild)
 
     if not ctx.guild.voice_client:
@@ -481,7 +492,6 @@ async def cmd_play(ctx: commands.Context, *, query: str):
 
 @bot.command(name="playlist", aliases=["pl"])
 async def cmd_playlist(ctx: commands.Context, *, url: str):
-    """Komplette YouTube-Playlist in die Queue laden."""
     state = get_state(ctx.guild)
 
     if not url.startswith("http"):
@@ -518,10 +528,9 @@ async def cmd_playlist(ctx: commands.Context, *, url: str):
 
 @bot.command(name="skip", aliases=["s"])
 async def cmd_skip(ctx: commands.Context):
-    """Aktuellen Song überspringen."""
     vc = ctx.guild.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
-        vc.stop()   # _after() ruft play_next() automatisch
+        vc.stop()
         await ctx.send("⏭️  Übersprungen.")
     else:
         await ctx.send("❌  Es läuft gerade nichts.")
@@ -529,7 +538,6 @@ async def cmd_skip(ctx: commands.Context):
 
 @bot.command(name="stop")
 async def cmd_stop(ctx: commands.Context):
-    """Musik stoppen und Queue leeren."""
     state = get_state(ctx.guild)
     vc = ctx.guild.voice_client
 
@@ -540,15 +548,21 @@ async def cmd_stop(ctx: commands.Context):
         vc.stop()
 
     channel = bot.get_channel(TARGET_VOICE_CHANNEL_ID)
-    if channel:
-        await _set_voice_state(ctx.guild, channel, mute=True)
+    if channel and vc and vc.is_connected():
+        try:
+            await ctx.guild.change_voice_state(
+                channel=channel,
+                self_mute=True,
+                self_deaf=True
+            )
+        except Exception:
+            pass
 
     await ctx.send("⏹️  Gestoppt und Queue geleert.")
 
 
 @bot.command(name="pause")
 async def cmd_pause(ctx: commands.Context):
-    """Pausiert die Wiedergabe."""
     vc = ctx.guild.voice_client
     if vc and vc.is_playing():
         vc.pause()
@@ -559,7 +573,6 @@ async def cmd_pause(ctx: commands.Context):
 
 @bot.command(name="resume", aliases=["r"])
 async def cmd_resume(ctx: commands.Context):
-    """Setzt pausierte Wiedergabe fort."""
     vc = ctx.guild.voice_client
     if vc and vc.is_paused():
         vc.resume()
@@ -570,7 +583,6 @@ async def cmd_resume(ctx: commands.Context):
 
 @bot.command(name="volume", aliases=["vol", "v"])
 async def cmd_volume(ctx: commands.Context, vol: int):
-    """Lautstärke setzen (0–100)."""
     vc = ctx.guild.voice_client
     if not vc or not (vc.is_playing() or vc.is_paused()):
         await ctx.send("❌  Läuft gerade nichts.")
@@ -579,7 +591,6 @@ async def cmd_volume(ctx: commands.Context, vol: int):
         await ctx.send("❌  Wert muss zwischen 0 und 100 liegen.")
         return
 
-    # PCMVolumeTransformer erreichbar über vc.source
     if hasattr(vc.source, "volume"):
         vc.source.volume = vol / 100
         await ctx.send(f"🔊  Lautstärke: **{vol}%**")
@@ -589,7 +600,6 @@ async def cmd_volume(ctx: commands.Context, vol: int):
 
 @bot.command(name="nowplaying", aliases=["np"])
 async def cmd_nowplaying(ctx: commands.Context):
-    """Zeigt den aktuell spielenden Song."""
     state = get_state(ctx.guild)
     if state.current:
         embed = discord.Embed(
@@ -607,7 +617,6 @@ async def cmd_nowplaying(ctx: commands.Context):
 
 @bot.command(name="queue", aliases=["q"])
 async def cmd_queue(ctx: commands.Context):
-    """Queue anzeigen."""
     state = get_state(ctx.guild)
 
     if not state.is_playing and not state.queue:
@@ -637,7 +646,6 @@ async def cmd_queue(ctx: commands.Context):
 
 @bot.command(name="clear")
 async def cmd_clear(ctx: commands.Context):
-    """Queue leeren (aktueller Song läuft weiter)."""
     state = get_state(ctx.guild)
     async with state.lock:
         state.queue.clear()
@@ -646,7 +654,6 @@ async def cmd_clear(ctx: commands.Context):
 
 @bot.command(name="remove", aliases=["rm"])
 async def cmd_remove(ctx: commands.Context, pos: int):
-    """Song an Position X aus der Queue entfernen."""
     state = get_state(ctx.guild)
     async with state.lock:
         if not 1 <= pos <= len(state.queue):
@@ -658,7 +665,6 @@ async def cmd_remove(ctx: commands.Context, pos: int):
 
 @bot.command(name="join")
 async def cmd_join(ctx: commands.Context):
-    """Bot in den Voice-Channel holen."""
     success = await safe_join(ctx.guild)
     channel = bot.get_channel(TARGET_VOICE_CHANNEL_ID)
     if success and channel:
@@ -669,7 +675,6 @@ async def cmd_join(ctx: commands.Context):
 
 @bot.command(name="bothelp", aliases=["h", "hilfe"])
 async def cmd_bothelp(ctx: commands.Context):
-    """Hilfe anzeigen."""
     embed = discord.Embed(
         title="🤖  Bot Commands",
         description="Prefix: `!`",
