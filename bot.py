@@ -52,6 +52,12 @@ WATCHDOG_INTERVAL_MINUTES = 10
 JOIN_TIMEOUT_SECONDS = 30
 RECONNECT_DELAY_SECONDS = 8
 
+# Prüfe PyNaCl (Pflicht für Voice)
+try:
+    import nacl  # noqa: F401
+except ImportError:
+    raise SystemExit("❌  PyNaCl fehlt! Installieren: pip install PyNaCl")
+
 
 # ══════════════════════════════════════════════════════════
 #  DATENMODELL
@@ -107,9 +113,10 @@ class MusicState:
 # ══════════════════════════════════════════════════════════
 
 intents = discord.Intents.default()
-intents.message_content = True   # Nur was wirklich gebraucht wird
-intents.voice_states = True
+intents.message_content = True
+intents.voice_states = True     # Pflicht für Voice
 intents.guilds = True
+intents.members = False         # Nicht nötig, spart Privileged-Intent
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
@@ -146,7 +153,8 @@ async def on_ready():
         )
     )
 
-    await asyncio.sleep(5)
+    # Länger warten bis Gateway-Session stabil ist (verhindert 4017)
+    await asyncio.sleep(10)
 
     for guild in bot.guilds:
         bot.loop.create_task(_initial_join(guild))
@@ -156,13 +164,24 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before, after):
-    """Reagiert NUR auf Bot-Disconnects."""
+    """Reagiert NUR auf echte Bot-Disconnects (nicht auf fehlgeschlagene Connects)."""
     if member.id != bot.user.id:
         return
-    if before.channel is not None and after.channel is None:
-        print(f"⚠️  Bot disconnected ({member.guild.name}) → Rejoin in {RECONNECT_DELAY_SECONDS}s …")
-        await asyncio.sleep(RECONNECT_DELAY_SECONDS)
-        await safe_join(member.guild)
+
+    # Nur auslösen wenn Bot vorher IN einem Channel war → echter Disconnect
+    if before.channel is None or after.channel is not None:
+        return
+
+    guild = member.guild
+    lock = get_connect_lock(guild.id)
+
+    # Wenn gerade aktiv verbunden wird → ignorieren (das ist der Fehlschlag selbst)
+    if lock.locked():
+        return
+
+    print(f"⚠️  Bot disconnected aus «{before.channel.name}» → Rejoin in {RECONNECT_DELAY_SECONDS}s …")
+    await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+    await safe_join(guild)
 
 
 @bot.event
@@ -181,7 +200,7 @@ async def on_command_error(ctx: commands.Context, error):
 # ══════════════════════════════════════════════════════════
 
 async def _initial_join(guild: discord.Guild):
-    await asyncio.sleep(3)
+    await asyncio.sleep(5)   # Extra Buffer nach on_ready
     await safe_join(guild)
 
 
@@ -192,7 +211,6 @@ async def safe_join(guild: discord.Guild) -> bool:
     """
     lock = get_connect_lock(guild.id)
 
-    # Bereits am Verbinden → nicht doppelt
     if lock.locked():
         return False
 
@@ -225,7 +243,6 @@ async def safe_join(guild: discord.Guild) -> bool:
             )
             print("✅  Verbunden!")
 
-            # Unmute falls gerade etwas spielt
             state = get_state(guild)
             if state.is_playing:
                 await _set_voice_state(guild, channel, mute=False)
@@ -234,12 +251,27 @@ async def safe_join(guild: discord.Guild) -> bool:
 
         except asyncio.TimeoutError:
             print("❌  Verbindungs-Timeout.")
+
         except discord.errors.ConnectionClosed as exc:
-            print(f"❌  Discord hat Verbindung abgelehnt (Code {exc.code}).")
-            if exc.code == 4006:
-                await asyncio.sleep(10)
+            code = exc.code
+            print(f"❌  Verbindung abgelehnt (Code {code}).")
+
+            if code == 4006:
+                # Session ungültig – länger warten, Discord muss aufräumen
+                print("💡  4006: Session ungültig. Warte 15s …")
+                await asyncio.sleep(15)
+            elif code == 4014:
+                print("💡  4014: Bot fehlt Voice-Permission im Channel!")
+            elif code == 4017:
+                # Undokumentierter Code: meistens kurzzeitige Rate-Limit / Gateway-Ablehnung
+                print("💡  4017: Gateway-Ablehnung. Warte 20s …")
+                await asyncio.sleep(20)
+            else:
+                await asyncio.sleep(5)
+
         except Exception as exc:
             print(f"❌  Verbindungsfehler: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(5)
 
         return False
 
