@@ -1,5 +1,2 @@
-discord.py==2.4.0
-yt-dlp
+discord.py
 PyNaCl
-python-dotenv
-audioop-lts
