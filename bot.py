@@ -19,9 +19,8 @@ TARGET_VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID"))
 queue = []
 is_playing = False
 current_title = ""
-is_connecting = False  # 🔑 Verhindert doppelte Verbindungsversuche
+is_connecting = False
 
-# ── YT-DLP Options ────────────────────────────────────────
 YDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": False,
@@ -32,11 +31,7 @@ YDL_OPTIONS = {
 }
 
 FFMPEG_OPTIONS = {
-    "before_options": (
-        "-reconnect 1 "
-        "-reconnect_streamed 1 "
-        "-reconnect_delay_max 5"
-    ),
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
 
@@ -53,103 +48,95 @@ async def on_ready():
             name="🎵 !play | 24/7"
         )
     )
-    await asyncio.sleep(3)
+    # Warten bis Gateway komplett stabil ist
+    await asyncio.sleep(5)
     await join_target_channel()
     stay_in_channel.start()
 
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """
-    NUR reagieren wenn Bot komplett disconnected wurde.
-    NICHT reagieren auf self_mute / self_deaf Änderungen!
-    """
-    # Nur Bot Events
+    # Nur Bot eigene Events
     if member.id != bot.user.id:
         return
 
-    # Ignorieren wenn gerade am Verbinden
+    # Ignorieren während wir verbinden
     if is_connecting:
         return
 
-    # Nur reagieren wenn Bot aus Channel fliegt (nach.channel = None)
-    # self_mute/self_deaf changes haben before.channel == after.channel
+    # Nur wenn Bot wirklich komplett rausfliegt
     if before.channel is not None and after.channel is None:
-        print("⚠️ Bot wurde disconnected! Rejoining in 5s...")
+        print("⚠️ Bot disconnected! Warte 5s dann rejoin...")
         await asyncio.sleep(5)
         await join_target_channel()
 
-
 # ══════════════════════════════════════════════════════════
-#  HELPER
+#  VERBINDUNG
 # ══════════════════════════════════════════════════════════
 
 async def join_target_channel():
-    """Joined den Ziel-Voice-Channel. Nur einmal gleichzeitig."""
     global is_connecting
 
-    # Verhindert dass Funktion mehrfach gleichzeitig läuft
     if is_connecting:
-        print("⏳ Bereits am Verbinden, überspringe...")
+        print("⏳ Verbindung läuft bereits...")
         return
 
     is_connecting = True
+    print("🔌 Starte Verbindungsversuch...")
 
     try:
         channel = bot.get_channel(TARGET_VOICE_CHANNEL_ID)
-
         if channel is None:
-            print("❌ Voice Channel nicht gefunden!")
+            print("❌ Channel nicht gefunden!")
             return
 
         guild = channel.guild
         vc = guild.voice_client
 
-        # Bereits im richtigen Channel → nur prüfen ob muted
+        # Bereits im richtigen Channel?
         if vc and vc.is_connected() and vc.channel.id == TARGET_VOICE_CHANNEL_ID:
-            print("✅ Bereits im Channel.")
-            # Self-Mute sicherstellen (falls nicht playing)
-            if not is_playing:
-                await guild.change_voice_state(
-                    channel=channel,
-                    self_mute=True,
-                    self_deaf=True
-                )
+            print("✅ Bereits verbunden.")
             return
 
-        # Alten VC sauber trennen
-        if vc and vc.is_connected():
-            await vc.disconnect(force=True)
-            await asyncio.sleep(2)
+        # Alte Verbindung HART trennen
+        if vc is not None:
+            try:
+                await vc.disconnect(force=True)
+                print("🔌 Alte Verbindung getrennt.")
+            except Exception:
+                pass
+            # Warten bis Discord die Session wirklich schließt
+            await asyncio.sleep(3)
 
-        # Neu verbinden
-        print(f"🔌 Verbinde mit: {channel.name}...")
-        vc = await channel.connect(timeout=30, reconnect=True)
-        await asyncio.sleep(2)  # Warten bis Verbindung stabil ist
+        # NEU verbinden - reconnect=False damit keine alte Session genutzt wird!
+        print(f"🔊 Verbinde mit {channel.name}...")
+        vc = await channel.connect(timeout=60, reconnect=False)
 
-        # DANN erst self_mute setzen
-        # Das triggert on_voice_state_update aber is_connecting=True
+        await asyncio.sleep(2)
+
+        # Self mute + deaf setzen
         await guild.change_voice_state(
             channel=channel,
             self_mute=True,
             self_deaf=True
         )
 
-        print(f"✅ Verbunden mit: {channel.name} | Muted & Deafened")
+        print(f"✅ Erfolgreich verbunden mit: {channel.name}")
 
+    except discord.errors.ConnectionClosed as e:
+        print(f"❌ Connection Closed ({e.code}): {e}")
+    except asyncio.TimeoutError:
+        print("❌ Timeout beim Verbinden!")
     except Exception as e:
-        print(f"❌ Fehler beim Verbinden: {e}")
+        print(f"❌ Fehler: {type(e).__name__}: {e}")
     finally:
-        # Immer freigeben, auch bei Fehler
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         is_connecting = False
 
 
 @tasks.loop(minutes=10)
 async def stay_in_channel():
-    """Watchdog: Prüft alle 10 Min ob Bot noch verbunden ist."""
-    global is_connecting
-
+    """Watchdog alle 10 Minuten."""
     if is_connecting:
         return
 
@@ -167,12 +154,13 @@ async def stay_in_channel():
         print("🔄 Watchdog: Falscher Channel → Wechsle...")
         await join_target_channel()
     else:
-        print("✅ Watchdog: Bot ist verbunden.")
+        print("✅ Watchdog: Alles OK.")
 
 
 @stay_in_channel.before_loop
 async def before_watchdog():
     await bot.wait_until_ready()
+    await asyncio.sleep(10)
 
 
 # ══════════════════════════════════════════════════════════
@@ -180,15 +168,11 @@ async def before_watchdog():
 # ══════════════════════════════════════════════════════════
 
 async def get_audio_url(query: str):
-    """YouTube Suche oder URL → Stream URL."""
     loop = asyncio.get_event_loop()
 
     def extract():
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            if not query.startswith("http"):
-                search = f"ytsearch:{query}"
-            else:
-                search = query
+            search = query if query.startswith("http") else f"ytsearch:{query}"
             info = ydl.extract_info(search, download=False)
             if "entries" in info:
                 info = info["entries"][0]
@@ -197,28 +181,24 @@ async def get_audio_url(query: str):
     try:
         return await loop.run_in_executor(None, extract)
     except Exception as e:
-        print(f"❌ Fehler beim Suchen: {e}")
+        print(f"❌ YT Fehler: {e}")
         return None, None, 0
 
 
 def format_duration(seconds: int) -> str:
     if not seconds:
         return "??:??"
-    minutes, secs = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours > 0:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
 
 
 async def play_next(guild):
-    """Nächsten Song aus Queue abspielen."""
     global is_playing, current_title
 
     if not queue:
         is_playing = False
         current_title = ""
-        print("📭 Queue leer → Zurück auf Mute")
         channel = bot.get_channel(TARGET_VOICE_CHANNEL_ID)
         if channel and guild.voice_client and guild.voice_client.is_connected():
             try:
@@ -227,13 +207,15 @@ async def play_next(guild):
                     self_mute=True,
                     self_deaf=True
                 )
-            except Exception as e:
-                print(f"⚠️ Mute Fehler: {e}")
+            except Exception:
+                pass
+        print("📭 Queue leer.")
         return
 
     vc = guild.voice_client
     if vc is None or not vc.is_connected():
         await join_target_channel()
+        await asyncio.sleep(3)
         vc = guild.voice_client
         if vc is None:
             is_playing = False
@@ -243,7 +225,6 @@ async def play_next(guild):
     is_playing = True
     current_title = title
 
-    # Mute aufheben zum Spielen
     channel = bot.get_channel(TARGET_VOICE_CHANNEL_ID)
     try:
         await guild.change_voice_state(
@@ -270,7 +251,7 @@ async def play_next(guild):
         print(f"▶️ Spiele: {title} [{format_duration(duration)}]")
 
     except Exception as e:
-        print(f"❌ Fehler beim Abspielen: {e}")
+        print(f"❌ Abspielfehler: {e}")
         is_playing = False
         await asyncio.sleep(2)
         await play_next(guild)
@@ -282,10 +263,7 @@ async def play_next(guild):
 
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query: str):
-    """!play <Song Name oder YouTube URL>"""
-    guild = ctx.guild
-    vc = guild.voice_client
-
+    vc = ctx.guild.voice_client
     if vc is None or not vc.is_connected():
         await join_target_channel()
 
@@ -299,17 +277,13 @@ async def play(ctx, *, query: str):
     queue.append((url, title, duration))
 
     embed = discord.Embed(color=discord.Color.green())
-    embed.add_field(
-        name="✅ Zur Queue hinzugefügt",
-        value=f"**{title}**",
-        inline=False
-    )
+    embed.add_field(name="✅ Hinzugefügt", value=f"**{title}**", inline=False)
     embed.add_field(name="⏱️ Länge", value=format_duration(duration), inline=True)
     embed.add_field(name="📋 Position", value=f"#{len(queue)}", inline=True)
     await msg.edit(content=None, embed=embed)
 
     if not is_playing:
-        await play_next(guild)
+        await play_next(ctx.guild)
 
 
 @bot.command(name="skip", aliases=["s"])
@@ -328,22 +302,18 @@ async def show_queue(ctx):
         await ctx.send("📭 Queue ist leer.")
         return
 
-    embed = discord.Embed(title="📋 Musik Queue", color=discord.Color.blue())
+    embed = discord.Embed(title="📋 Queue", color=discord.Color.blue())
 
     if current_title:
-        embed.add_field(
-            name="▶️ Spielt gerade",
-            value=f"**{current_title}**",
-            inline=False
-        )
+        embed.add_field(name="▶️ Jetzt", value=f"**{current_title}**", inline=False)
 
     if queue:
-        queue_text = ""
-        for i, (_, title, duration) in enumerate(queue[:10], 1):
-            queue_text += f"`{i}.` {title} `[{format_duration(duration)}]`\n"
+        text = ""
+        for i, (_, title, dur) in enumerate(queue[:10], 1):
+            text += f"`{i}.` {title} `[{format_duration(dur)}]`\n"
         if len(queue) > 10:
-            queue_text += f"\n*...und {len(queue) - 10} weitere*"
-        embed.add_field(name="📋 Nächste Songs", value=queue_text, inline=False)
+            text += f"*...und {len(queue) - 10} weitere*"
+        embed.add_field(name="📋 Nächste", value=text, inline=False)
 
     await ctx.send(embed=embed)
 
@@ -352,23 +322,15 @@ async def show_queue(ctx):
 async def stop(ctx):
     global queue, is_playing, current_title
     vc = ctx.guild.voice_client
-
     if vc and vc.is_playing():
         vc.stop()
-
     queue.clear()
     is_playing = False
     current_title = ""
-
     channel = bot.get_channel(TARGET_VOICE_CHANNEL_ID)
     if channel:
-        await ctx.guild.change_voice_state(
-            channel=channel,
-            self_mute=True,
-            self_deaf=True
-        )
-
-    await ctx.send("⏹️ Gestoppt & Queue geleert.")
+        await ctx.guild.change_voice_state(channel=channel, self_mute=True, self_deaf=True)
+    await ctx.send("⏹️ Gestoppt.")
 
 
 @bot.command(name="pause")
@@ -399,7 +361,7 @@ async def volume(ctx, vol: int):
             vc.source.volume = vol / 100
             await ctx.send(f"🔊 Lautstärke: **{vol}%**")
         else:
-            await ctx.send("❌ Wert zwischen 0 und 100!")
+            await ctx.send("❌ Wert zwischen 0-100!")
     else:
         await ctx.send("❌ Läuft nichts.")
 
@@ -442,11 +404,10 @@ async def bothelp(ctx):
     embed.add_field(
         name="🎵 Musik",
         value=(
-            "`!play <Song/URL>` - Song abspielen\n"
+            "`!play <Song/URL>` - Abspielen\n"
             "`!skip` - Überspringen\n"
             "`!stop` - Stoppen\n"
-            "`!pause` - Pausieren\n"
-            "`!resume` - Fortsetzen\n"
+            "`!pause` / `!resume` - Pause\n"
             "`!volume <0-100>` - Lautstärke\n"
             "`!queue` - Queue anzeigen\n"
             "`!clear` - Queue leeren\n"
@@ -454,11 +415,7 @@ async def bothelp(ctx):
         ),
         inline=False
     )
-    embed.add_field(
-        name="🔊 Voice",
-        value="`!join` - Bot in Channel rufen",
-        inline=False
-    )
+    embed.add_field(name="🔊 Voice", value="`!join` - Bot rufen", inline=False)
     await ctx.send(embed=embed)
 
 
