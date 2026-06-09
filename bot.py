@@ -1,29 +1,62 @@
 import os
+import asyncio
 import discord
-from discord.ext import commands, tasks
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN_1 = os.getenv("DISCORD_TOKEN_1")
+TOKEN_2 = os.getenv("DISCORD_TOKEN_2")
 CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID"))
 
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+class VoiceBot(discord.Client):
+    def __init__(self, leave_after_hours):
+        super().__init__(intents=discord.Intents.default())
+        self.leave_after = leave_after_hours * 3600
 
-@bot.event
-async def on_ready():
-    print(f"Eingeloggt als {bot.user}")
-    keep_connected.start()
+    async def on_ready(self):
+        print(f"✅ Online: {self.user}")
+        self.loop.create_task(self.voice_loop())
 
-@tasks.loop(seconds=30)
-async def keep_connected():
-    channel = bot.get_channel(CHANNEL_ID)
+    async def voice_loop(self):
+        await self.wait_until_ready()
 
-    if channel is None:
-        return
+        while not self.is_closed():
+            channel = self.get_channel(CHANNEL_ID)
 
-    vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
+            if channel:
+                vc = discord.utils.get(
+                    self.voice_clients,
+                    guild=channel.guild
+                )
 
-    if vc is None or not vc.is_connected():
-        await channel.connect(self_deaf=True)
-        print("Voice verbunden")
+                if vc is None or not vc.is_connected():
+                    try:
+                        await channel.connect(self_deaf=True)
+                        print(f"{self.user} → Voice verbunden")
+                    except Exception as e:
+                        print(f"{self.user} → Fehler beim Joinen: {e}")
 
-bot.run(TOKEN)
+                await asyncio.sleep(self.leave_after)
+
+                vc = discord.utils.get(
+                    self.voice_clients,
+                    guild=channel.guild
+                )
+
+                if vc and vc.is_connected():
+                    try:
+                        await vc.disconnect()
+                        print(f"{self.user} → Voice verlassen")
+                    except Exception as e:
+                        print(f"{self.user} → Fehler beim Verlassen: {e}")
+
+                await asyncio.sleep(60)
+
+async def main():
+    bot1 = VoiceBot(23)  # 23 Stunden
+    bot2 = VoiceBot(26)  # 26 Stunden
+
+    await asyncio.gather(
+        bot1.start(TOKEN_1),
+        bot2.start(TOKEN_2)
+    )
+
+asyncio.run(main())
